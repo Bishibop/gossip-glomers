@@ -1,63 +1,70 @@
 package main
 
+// Approaches:
+//      CAS with retries
+//          will degrade as node count goes up?
+//      log specific writer nodes
+//          each log has a single node that does all the writing to that log.
+//          You can then solve concurrent requests with just mutexes
+//          Would need to forward messages to the writer node. These would need to be idempotent
+//              This would be the complex step
+//          Supports buffering writes
+//      node-specific log subsets
+//          all nodes are writer nodes for all logs
+//          solve contention by having each node write to its own subset of each log
+//          reads would then have to correctly reconstruct a consistent log
+//              This would be the complex step
+//              How do you do this? Request all the log subsets, stitch them together
+//              How do you make sure the log doesn't become inconsistent. You can't just sort them by timestamp
+//              The other log could later add one that is before the end of a different subset
+//              You could clip off anything more than the earliest ending. Then sort. That would ensure consistency
+//              but it would never "converge"(?). You'd always be clipping off something
+//              could you handle offsets the same way?
+//       write leader
 
-// Whats going on the with unending send ok replys
-// Seems like we're never falling into the idempotency check?
-// We don't seem to be removing keys from the pendingForwards set correctly. We forwarded a message, got the send_ok back and the continued to forward it later. But only when we had an issue with another forward?
-// After another no key error, I got the same double forwards.
+// Implemented Optimizations:
+// * Have a single writer with message forwarding so you don't need to do CAS with retries
+//   (messages per op, between 6.1 8.5 server)
+// * Buffer writes (messages per op, between 5.5) Down a bit, but not too much.
+//      Can do this because reads don't have ot be up to date, so we can tolerate some delay on writes
+//      Seems like it killed latency. Realtime lag went from like .3 to 9 seconds
+//      Why am I optimizing writes when it's poll reads that are killing performance. Idiot.
+//      Now that I think about it, write buffers seem like generally bad idea
 
-// TODO:
-// * Buffer writes?
-// * Cache reads?
-// * Could still do some divided writing. So go back to dividing the logs for writing Wit ht emod. Just hard code it for 2 noes. Probably not a big deal for performance with 2 nodes
+// Potential optimizations
+// * Buffer writes
+//   * You can do this because read's don't have to be up to date, so it doesn't matter if writes are delayed
+//   * Does risk losing the buffer on machine failure
+// * Instant replies on buffered writes.
+//   * Rather than waiting for the write to be committed, just reply immediately
+//   * Would need to store a hash of offsets to reply to "send" messages
+// * Cache ths logs. Read from cached logs rather than the kv
+// * Somehow aggegate reads requests?
+//   * bundle the logs together to minimize read requests
+// * Minimize read message size? Don't return whole log for every read? You don't need it do you?
 // * Biggest gains will probably be in caching read info rather then requesting whole logs.
 // * Implement zipper idea. 2 datasets in the kv. Published logs for reading. Smaller write space for segmented writes paired with a periodic processing of the write space into the published logs. Works because reads don't have to be up to date
+// * Keep some info locally in the node? What would I keep? Most recent logs?
+//   * How does this handle if a node goes down? Get's into the idea of "promotion". Possibly out of the scope of the challenge? I think all it does is partition the nodes. But that's enough to break the segmentation idea. If you're partitioned, how do you handle that. I guess you could buffer those as well... Then your writes get *really* out of order. Again, maybe that doesn't matter. Problem only talked aout read/write consistency
+// * Some kind of data retructuring
+// * Making some use of multiple data structures (one for reads, one for writes?)
+// * don't read before you write. Keep a local version of each log and just write what should be in the db.
+//   * I mean, if we're doing that, we don't need to write either, just keep an in memory log and never use the kv. If we only have one writer..., but then who can read? forward those as well :), just use the node as the kv
+//   * feels like it's going against the spirit of the problem
+// * Parallelize log reads. So with the structure of the data we have, each log in it's own key. To read multiple logs in a single poll, we have to issue a bunch of reads. These are done in sequence when they should be parallelized. This would improve latency but not messages per op
+// * Group logs into small sets so my polls can make fewer requests vs 1 per log. Improve both latency and messages per op
 
-
-
-
-
-// Questions:
-//  what does it mean when they say that not every offset must contain a message?
-//  why would you skip offsets?
-//    I can see if you divided them into sets of arrays for some efficient lookup. so like 1-1000, 1001-2000, etc
-//    and then you would have large gaps
-//  Do offsets need to be unique across logs?
 // Notes:
 //    There can be gaps in offsets
 //    No recency requirement. Poll does not have to return the most up to date messages coming in through send
 //    Poll does have to return messages without skipping any though
 //    Offset log should always increase. No inserting message before previous messages. Append only
-// Approach:
-//    How to store the logs? Hash of arrays is the simplest that I can think of. Drawbacks...
-//
-//    How am I handling the inialization of the different logs? could do it dynamically, or just watch the logs for failed messages and hardcode whatever the problem is asking for. We'll do this. Then the code can just rely on them being there
-
-
-// Potential Optimizations:
-//   * Don't send the whole log on reads. Somehow segment the log into digestible units
-//   * Keep some info locally in the node? What would I keep?
-//   * Segment which logs each node cares about? I mean, if the logs are stored in the kv, then what advantage to that is there here
-//     * If you do this, you forward the other node's writes to them. But what happens if they get a write in the meantime? Do writes need to be in order across the whole system?
-//     * Do need to forward reads? No. Any node can read.
-//     * How does this handle if a node goes down? Get's into the idea of "promotion". Possibly out of the scope of the challenge? I think all it does is partition the nodes. But that's enough to break the segmentation idea. If you're partitioned, how do you handle that. I guess you could buffer those as well... Then your writes get *really* out of order. Again, maybe that doesn't matter. Problem only talked aout read/write consistency
-//     * Just keep a list of write forwards, keep retrying them until you get an ok, then remove them. Need to make sure it's idempotent, eugh. WHY CAN"T I JUST HAVE EVERY NODE WRITE
-//     * WAIT. What if I have every node write to it's own subset/key in the log... No conflicts, no forwarding. But what about guaranteeing read/write consistency. Yeah, how do you handle the offsets... Some single offset oracle? I wonder if there's a way to convert timestamps to monotonically increasing integers. I mean, you can just use the nonosecond timestamp.
-//   * Buffer writes. Maybe not relevant to the problem, but this increases the risk of losing any data in the buffer.
-//     * If you buffer writes, do you have to hold reads?I think the problem said no? As long as they're in order
-//   * Data structure - just write the log offsets in to the keys? Lol, you'd have to do a read for every message
-//   * Cache reads
-//   * Break up the logs into smaller segments so you don't have to send the whole log in every read? This seems like caching reads. Maybe have some sliding window "delta" seperate from the whole log that you can request and stitch into a cached version of the whole log
-//   * You could have one mutex for every log rather than every node
-//   * Ohhh, the writer node system, maxes out your scalability to the number of logs you have. That's a huge drawwback
-
-
 
 
 import (
     "log"
     "os"
-    "github.com/google/uuid"
+    // "github.com/google/uuid"
     "encoding/json"
     // "reflect"
     // "fmt"
@@ -70,29 +77,83 @@ import (
     maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+func forwardAndRespond(node *maelstrom.Node, targetNodeID string, msg maelstrom.Message, buildResponse func(map[string]interface{}) (map[string]interface{}, error)) error {
+    var body map[string]interface{}
+    if err := json.Unmarshal(msg.Body, &body); err != nil {
+        return err
+    }
+
+    if node.ID() == targetNodeID {
+        response, err := buildResponse(body)
+        if err != nil {
+            return err
+        }
+        // If this was a forwarded messages
+        if body["originalSenderID"] != nil {
+            // Respond to the original (external) sender
+            response["in_reply_to"] = body["originalMessageID"]
+            return node.Send(body["originalSenderID"].(string), response)
+            // Respond to the fowarding node
+            // Only need this for idempotency if I decide to reimplement it
+            // return n.Reply(msg, map[string]interface{}{ "type": "send_ok" })
+        } else {
+            return node.Reply(msg, response)
+        }
+    } else {
+        // Forward to the appropriate writer node
+        body["originalSenderID"] = msg.Src
+        body["originalMessageID"] = body["msg_id"]
+        return node.Send(targetNodeID, body)
+    }
+}
+
 func main() {
     n := maelstrom.NewNode()
     writerNodeID := "n1"
     kLogs := maelstrom.NewLinKV(n)
     kLogsMutex := &sync.Mutex{}
     kLogCommittedOffsetsMutex := &sync.Mutex{}
-    type PendingForward struct {
-        destinationID string
-        msgBody interface{}
-    }
-    pendingForwards := map[string]PendingForward{} // A set as well
-    processedForwards := map[string]bool{}
-    // some kind of pending forwarded array
-    // put every forwarded message in here, oh but how do we know it's been processed? Need another handler for forwarded message?
-    // who replies to the client? both?
-    // do you reply to the client immediately? or after the job is done? let's just do it when the job is done
-    // we'll have the final handler node do both. Reply to the original message and send a confirmation to the forwarding node
-    // what about concurrency here as well? :) if you just append and copy, then you could copy over while another message is being removed. just use a mutex
+    // {
+    //   send-$LOG_KEY: [logMsg, logMsg, logMsg],
+    //   send-$LOG_KEY: [logMsg, logMsg, logMsg],
+    //   commitOffsets-$LOG_KEY: latestOffset,
+    //   commitOffsets-$LOG_KEY: latestOffset,
+    // }
+    // We are appending to the send array value and replacing the offsets values
+    // Now, what interactions are there here with other messages and each of these messages?
+    // Are they independent of everything else?
+    // Sends are independent of polls. Polls can return stale data, Can commitOffsets somehow get ahead of sends?
+    // Can list offsets return stale data??? I don't think so! I don't think commit offsets can be buffered
+    // If they say we're commited up to 2000 but that doesn't get written immediately, and they ask for
+    // commited offsets,  we return a value lower than 2000, then they would start to reprocess those values
+    // So we can't buffer committedOffsets in isolation. Maybe paired with cached reads?
+    // How could they say they're commited up to a value if I don't write up to that value? Maybe there's a way to coordinate with send buffer to make it work? Must be able to. If the sends don't get written, they can't get polled, so the client can't process them and commit past what's been written.
+    // Just write everything at once? Lock all reads while writing? Does that matter?
+
+
+    // 2 concurrency issues to deal with.
+    //   Requests while writes are being buffered.
+    //     Here I think a naive approach should work. Stale poll are fine.
+    //   Requests while the buffer is being written
+    //     Have the double buffer to catch incoming writes. Or rather, just duplicate the buffer clear it and release it?
+    //     What about reads though? Can you read while writing. I guess why not? Only thing I can think of would be the order of the writes fucking with the reads, but if you just write them in order it shouldn't be any different from getting a bunch of writes at once...
+
+
+    // This in effect can reorder sends and offsets within themselves. If we do all sends before offsets. Eh, just do them in the order that you go them
+    // What if we get a send or commit offset while writing? Hold the connetion open with locks? No, just put them
+    // in another buffer. Lock the first buffer and start writing to the second buffer
+
+    // Open issues:
+    //      How does aggregating the writes affect things? single write for each log and offset
+    //      Can you aggregate commitOffsets? Can you buffer it?
+    writeBuffer := map[string][]interface{}{}
+    writeBufferMutex := &sync.Mutex{}
+    latestOffsets := [500]int{}
+    latestOffsetsMutex := &sync.Mutex{}
 
     // Initialize the logs
-    // I wonder if these lin-kv requests won't finish before the inbound requests start coming in?
     n.Handle("init", func(msg maelstrom.Message) error {
-        if n.ID() == "n1" {
+        if n.ID() == writerNodeID {
             for i := 0; i <= 500; i++ {
                 writeLogCtx, writeLogCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
                 writeOffsetCtx, writeOffsetCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
@@ -103,48 +164,13 @@ func main() {
             }
         }
 
-        // response := map[string]interface{}{ "type": "init_ok" }
-        // return n.Reply(msg, response)
-        return nil
+        return n.Reply(msg, map[string]interface{}{ "type": "init_ok" })
     })
 
-
-    // Approaches:
-    //      CAS with retries
-    //          will degrade as node count goes up?
-    //      log specific writer nodes
-    //          each log has a single node that does all the writing to that log.
-    //          You can then solve concurrent requests with just mutexes
-    //          Would need to forward messages to the writer node. These would need to be idempotent
-    //              This would be the complex step
-    //          Supports buffering writes
-    //      node-specific log subsets
-    //          all nodes are writer nodes for all logs
-    //          solve contention by having each node write to its own subset of each log
-    //          reads would then have to correctly reconstruct a consistent log
-    //              This would be the complex step
-    //              How do you do this? Request all the log subsets, stitch them together
-    //              How do you make sure the log doesn't become inconsistent. You can't just sort them by timestamp
-    //              The other log could later add one that is before the end of a different subset
-    //              You could clip off anything more than the earliest ending. Then sort. That would ensure consistency
-    //              but it would never "converge"(?). You'd always be clipping off something
-    //              could you handle offsets the same way?
-    //
-    //
-    //          hmm, is this seems dumb, reads should be much more common that writes?, well no, it's a log. opposite should be true.
-    //          Supports buffering writes
-    //
-    // Read the appropriate log. Append to it, write it back
-    // Issue. how do you deal with multipl enodes writing to the same log.
-    //      Mutex lock then CAS. Actually this won't work. Mutex's don't lock across notes of course.
-    //      CAS with retries. Eugh.
-    //      Segment logs across nodes. Then you ust need to lock across multiple requests to the same node. Is that any different? Yes, here mutexes would work
-    // Does this have anything to do with linearizability? Linearizability only helps with multile writes fromt he same node in a row? what does liearizability get me in this problem
-    // This is where you could segment the log. If only one node handles one log, then it can just use a mutx on it's won requests. Or a channel.Or buffer the writes
-    //
-    //
-    //
-    // Alright, I'm just going to do a dedicated writer node
+    // Test removing this. I don't think it did anything regarding the client crashes
+    n.Handle("topology", func(msg maelstrom.Message) error {
+        return n.Reply(msg, map[string]interface{}{ "type": "topology_ok" })
+    })
 
     // Request
     // {
@@ -157,96 +183,70 @@ func main() {
     //   "type": "send_ok",
     //   "offset": 1000
     // }
+    // n.Handle("send", func(msg maelstrom.Message) error {
+    //     return forwardAndRespond(
+    //         n,
+    //         writerNodeID,
+    //         msg,
+    //         func(body map[string]interface{}) (map[string]interface{}, error) {
+    //             logKey := body["key"].(string)
+    //             logMessage := int(body["msg"].(float64))
+    //
+    //             // Locking across a network request. Feels wrong. Would channels do any better?
+    //             // No... CAS likely only superior solution
+    //             // Do I need to do this? Yes? That's the whole point?
+    //             kLogsMutex.Lock()
+    //
+    //             // Read the previous value of the log
+    //             readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+    //             defer readCancel()
+    //             kLog, readErr := kLogs.Read(readCtx, "log-"+logKey)
+    //             if readErr != nil {
+    //                 return nil, readErr
+    //             }
+    //
+    //             // Append the new value
+    //             newKLog := append(kLog.([]interface{}), logMessage)
+    //
+    //             // Write the new log back to the kv
+    //             writeCtx, writeCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+    //             defer writeCancel()
+    //             kLogs.Write(writeCtx, "log-"+logKey, newKLog)
+    //
+    //             kLogsMutex.Unlock()
+    //
+    //             return map[string]interface{}{
+    //                 "type": "send_ok",
+    //                 "offset": len(newKLog) - 1,
+    //             }, nil
+    //         },
+    //     )
+    // })
+
     n.Handle("send", func(msg maelstrom.Message) error {
-        var body map[string]interface{}
-        if err := json.Unmarshal(msg.Body, &body); err != nil {
-            return err
-        }
-        logKey := body["key"].(string)
-        logMessage := int(body["msg"].(float64))
+        return forwardAndRespond(
+            n,
+            writerNodeID,
+            msg,
+            func(body map[string]interface{}) (map[string]interface{}, error) {
+                logKey := body["key"].(string)
+                logMessage := int(body["msg"].(float64))
 
-        if n.ID() == writerNodeID {
-            // write to the log
+                writeBufferMutex.Lock()
+                writeBuffer[logKey] = append(writeBuffer[logKey], logMessage)
+                writeBufferMutex.Unlock()
 
-            // Idempotency check
-            if body["forwardUniqueID"] != nil && processedForwards[body["forwardUniqueID"].(string)] {
-                // Already processed this message
-                // Reply to sender so they can remove the message from their pending forwards
-                return n.Reply(msg, map[string]interface{}{
-                    "type": "forward_confirm",
-                    "forwardUniqueID": body["forwardUniqueID"],
-                })
-            } else {
-                // Locking across a network request. Feels wrong. Would channels do any better?
-                // No... CAS likely only superior solution
-                kLogsMutex.Lock()
+                i, _ := strconv.Atoi(logKey)
+                latestOffsetsMutex.Lock()
+                latestOffsets[i] = latestOffsets[i] + 1
+                latestOffsetsMutex.Unlock()
 
-                // Read the previous value of the log
-                readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-                defer readCancel()
-                kLog, readErr := kLogs.Read(readCtx, "log-"+logKey)
-                if readErr != nil {
-                    return readErr
-                }
-
-                // Append the new value
-                newKLog := append(kLog.([]interface{}), logMessage)
-
-                // Write the new log back to the kv
-                writeCtx, writeCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
-                defer writeCancel()
-                kLogs.Write(writeCtx, "log-"+logKey, newKLog)
-
-                kLogsMutex.Unlock()
-
-                response := map[string]interface{}{
+                return map[string]interface{}{
                     "type": "send_ok",
-                    "offset": len(newKLog) - 1,
-                }
-
-                // If this was a forwarded messages
-                if body["forwardUniqueID"] != nil {
-                    // Respond to the original (external) sender
-                    n.Send(body["originalSenderID"].(string), response)
-                    processedForwards[body["forwardUniqueID"].(string)] = true
-                    // Respond to the fowarding node
-                    return n.Reply(msg, map[string]interface{}{
-                        "type": "forward_confirm",
-                        "forwardUniqueID": body["forwardUniqueID"],
-                    })
-                } else {
-                    return n.Reply(msg, response)
-                }
-            }
-        } else {
-            // Forward to the appropriate writer node
-            forwardUniquenessID := uuid.New().String()
-            // body["type"] = "send" // maybe I need to set this?
-            body["originalSenderID"] = msg.Src
-            body["forwardUniqueID"] = forwardUniquenessID // for idempotency
-            pendingForwards[forwardUniquenessID] = PendingForward{destinationID: writerNodeID, msgBody: body}
-            return n.Send(writerNodeID, body)
-            // return n.RPC(writerNodeID, body, func(msg maelstrom.Message) error {
-            //     // remove from the retry set
-            //     var body map[string]interface{}
-            //     if err := json.Unmarshal(msg.Body, &body); err != nil {
-            //         return err
-            //     }
-            //     delete(pendingForwards, body["forwardUniqueID"].(string))
-            //     return nil
-            // })
-        }
-    })
-
-    n.Handle("forward_confirm", func(msg maelstrom.Message) error {
-        // remove from the retry set
-        log.Fatal("failed in forward_confirm")
-        var body map[string]interface{}
-        if err := json.Unmarshal(msg.Body, &body); err != nil {
-            return err
-        }
-        delete(pendingForwards, body["forwardUniqueID"].(string))
-        return nil
+                    "offset": latestOffsets[i] - 1,
+                }, nil
+            },
+        )
     })
 
     // Request
@@ -262,22 +262,13 @@ func main() {
     //   "type": "commit_offsets_ok"
     // }
     n.Handle("commit_offsets", func(msg maelstrom.Message) error {
-        var body map[string]interface{}
-        if err := json.Unmarshal(msg.Body, &body); err != nil {
-            return err
-        }
-        committedOffsets := body["offsets"].(map[string]interface{})
+        return forwardAndRespond(
+            n,
+            writerNodeID,
+            msg,
+            func(body map[string]interface{}) (map[string]interface{}, error) {
+                committedOffsets := body["offsets"].(map[string]interface{})
 
-        if n.ID() == writerNodeID {
-            // for each, read it, compare it, then write it
-            if body["forwardUniqueID"] != nil && processedForwards[body["forwardUniqueID"].(string)] {
-                // Already processed this message
-                // Reply to sender so they can remove the message from their pending forwards
-                return n.Reply(msg, map[string]interface{}{
-                    "type": "forward_confirm",
-                    "forwardUniqueID": body["forwardUniqueID"],
-                })
-            } else {
                 for logKey, proposedOffset := range committedOffsets {
                     offset := int(proposedOffset.(float64))
                     kLogCommittedOffsetsMutex.Lock()
@@ -285,7 +276,7 @@ func main() {
                     defer readCancel()
                     kLogCommittedOffsetTemp, readErr := kLogs.Read(readCtx, "offset-" + logKey)
                     if readErr != nil {
-                        return readErr
+                        return nil, readErr
                     }
                     kLogCommittedOffset := kLogCommittedOffsetTemp.(int)
 
@@ -297,40 +288,11 @@ func main() {
                     kLogCommittedOffsetsMutex.Unlock()
                 }
 
-                response := map[string]interface{}{
+                return map[string]interface{}{
                     "type": "commit_offsets_ok",
-                }
-                if body["forwardUniqueID"] != nil {
-                    // Respond to the original (external) sender
-                    n.Send(body["originalSenderID"].(string), response)
-                    processedForwards[body["forwardUniqueID"].(string)] = true
-                    // Respond to the fowarding node
-                    return n.Reply(msg, map[string]interface{}{
-                        "type": "forward_confirm",
-                        "forwardUniqueID": body["forwardUniqueID"],
-                    })
-                } else {
-                    return n.Reply(msg, response)
-                }
-            }
-        } else {
-            // Forward to the appropriate writer node
-            forwardUniquenessID := uuid.New().String()
-            // body["type"] = "send" // maybe I need to set this?
-            body["originalSenderID"] = msg.Src
-            body["forwardUniqueID"] = forwardUniquenessID // for idempotency
-            pendingForwards[forwardUniquenessID] = PendingForward{destinationID: writerNodeID, msgBody: body}
-            // return n.Send(writerNodeID, body)
-            return n.RPC(writerNodeID, body, func(msg maelstrom.Message) error {
-                // remove from the retry set
-                var body map[string]interface{}
-                if err := json.Unmarshal(msg.Body, &body); err != nil {
-                    return err
-                }
-                delete(pendingForwards, body["forwardUniqueID"].(string))
-                return nil
-            })
-        }
+                }, nil
+            },
+        )
     })
 
     // Request
@@ -357,12 +319,13 @@ func main() {
         requestedOffsets := body["offsets"].(map[string]interface{})
 
         offsetResponses := map[string][][]int{}
+        // Can this be done in parallel?
         for logKey, requestedOffset := range requestedOffsets {
             offset := int(requestedOffset.(float64))
             offsetMessages := [][]int{}
             readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
             defer readCancel()
-            kLogTemp, readErr := kLogs.Read(readCtx, "log-"+logKey)
+            kLogTemp, readErr := kLogs.Read(readCtx, "log-" + logKey)
             if readErr != nil {
                 return readErr
             }
@@ -407,6 +370,12 @@ func main() {
         }
         requestedOffsetKeys := body["keys"].([]interface{})
 
+        // Does this need to be refactored to latestOffsets? Basically caching reads? sort of
+        // If so, then do we need to store the committed offsets in the klog at all?
+        // But then, do we need to store anything there? Well the offsets are *way* less memory
+        // No, these are different sets of offsets. In memory is the offset of the last messsage
+        // committed offsets it eh offset they've processed up to. That said, we could probably cache this in memory
+        // How do you deal with server crashes though
         responseOffsets := map[string]int{}
         for _, requestedOffsetKey := range requestedOffsetKeys {
             offsetKey := requestedOffsetKey.(string)
@@ -428,11 +397,33 @@ func main() {
     })
 
     go func() {
-        forwardRetryTicker := time.NewTicker(time.Second / 25)
-        defer forwardRetryTicker.Stop()
-        for range forwardRetryTicker.C {
-            for _, pendingForward := range pendingForwards {
-                n.Send(pendingForward.destinationID, pendingForward.msgBody)
+        writeBufferFlushTicker := time.NewTicker(time.Second / 50)
+        defer writeBufferFlushTicker.Stop()
+        for range writeBufferFlushTicker.C {
+            if len(writeBuffer) > 0 {
+                writeBufferMutex.Lock()
+                tempWriteBuffer := writeBuffer
+                writeBuffer = map[string][]interface{}{}
+                writeBufferMutex.Unlock()
+                for logKey, bufferedMessages := range tempWriteBuffer {
+                    kLogsMutex.Lock() // Don't actually thing this is necessary anymore. Only needed if previous tick is still running. We'll keep it.
+
+                    // Read the previous value of the log
+                    readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+                    defer readCancel()
+                    kLog, _ := kLogs.Read(readCtx, "log-"+logKey)
+
+                    // Append the new value
+                    newKLog := append(kLog.([]interface{}), bufferedMessages...)
+
+                    // Write the new log back to the kv
+                    writeCtx, writeCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+                    defer writeCancel()
+                    kLogs.Write(writeCtx, "log-"+logKey, newKLog)
+
+                    kLogsMutex.Unlock()
+                }
+
             }
         }
     }()
