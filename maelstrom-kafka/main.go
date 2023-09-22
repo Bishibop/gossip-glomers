@@ -27,17 +27,20 @@ package main
 //   (messages per op, between 6.1 8.5 server)
 // * Buffer writes (messages per op, between 5.5) Down a bit, but not too much.
 //      Can do this because reads don't have ot be up to date, so we can tolerate some delay on writes
-//      Seems like it killed latency. Realtime lag went from like .3 to 9 seconds
 //      Why am I optimizing writes when it's poll reads that are killing performance. Idiot.
-//      Now that I think about it, write buffers seem like generally bad idea
+//      Tradeoff, latency, data loss on node crash, debugging/system anaylsis
+//      Now that I implemented it, write buffers seem like a generally bad idea
+// * Instant replies on buffered writes.
+//      Rather than waiting for the write to be committed, just reply immediately
+//      Do this by storing an in-memory hash of max offsets
+//      Tradeoff, what happens when your machine crashes and you lose the in memory hash? Would need to rebuild it from the kv
+// * Group logs into sets of 10 (messages per op, 3.3)
+//      Reduces requests to the kv
+//      Reduces latency (those requests were being made serially)
+//      Tradeoff, larger messages and can cause more write contention depending on how you do everything else
+//      Only works well here because we have 1 writer
 
 // Potential optimizations
-// * Buffer writes
-//   * You can do this because read's don't have to be up to date, so it doesn't matter if writes are delayed
-//   * Does risk losing the buffer on machine failure
-// * Instant replies on buffered writes.
-//   * Rather than waiting for the write to be committed, just reply immediately
-//   * Would need to store a hash of offsets to reply to "send" messages
 // * Cache ths logs. Read from cached logs rather than the kv
 // * Somehow aggegate reads requests?
 //   * bundle the logs together to minimize read requests
@@ -52,6 +55,7 @@ package main
 //   * I mean, if we're doing that, we don't need to write either, just keep an in memory log and never use the kv. If we only have one writer..., but then who can read? forward those as well :), just use the node as the kv
 //   * feels like it's going against the spirit of the problem
 // * Parallelize log reads. So with the structure of the data we have, each log in it's own key. To read multiple logs in a single poll, we have to issue a bunch of reads. These are done in sequence when they should be parallelized. This would improve latency but not messages per op
+//     You can do this with go routines. Look over each and go func() { }() for each one.
 // * Group logs into small sets so my polls can make fewer requests vs 1 per log. Improve both latency and messages per op
 
 // Notes:
@@ -110,42 +114,10 @@ func forwardAndRespond(node *maelstrom.Node, targetNodeID string, msg maelstrom.
 func main() {
     n := maelstrom.NewNode()
     writerNodeID := "n1"
+    groupSize := 10
     kLogs := maelstrom.NewLinKV(n)
     kLogsMutex := &sync.Mutex{}
     kLogCommittedOffsetsMutex := &sync.Mutex{}
-    // {
-    //   send-$LOG_KEY: [logMsg, logMsg, logMsg],
-    //   send-$LOG_KEY: [logMsg, logMsg, logMsg],
-    //   commitOffsets-$LOG_KEY: latestOffset,
-    //   commitOffsets-$LOG_KEY: latestOffset,
-    // }
-    // We are appending to the send array value and replacing the offsets values
-    // Now, what interactions are there here with other messages and each of these messages?
-    // Are they independent of everything else?
-    // Sends are independent of polls. Polls can return stale data, Can commitOffsets somehow get ahead of sends?
-    // Can list offsets return stale data??? I don't think so! I don't think commit offsets can be buffered
-    // If they say we're commited up to 2000 but that doesn't get written immediately, and they ask for
-    // commited offsets,  we return a value lower than 2000, then they would start to reprocess those values
-    // So we can't buffer committedOffsets in isolation. Maybe paired with cached reads?
-    // How could they say they're commited up to a value if I don't write up to that value? Maybe there's a way to coordinate with send buffer to make it work? Must be able to. If the sends don't get written, they can't get polled, so the client can't process them and commit past what's been written.
-    // Just write everything at once? Lock all reads while writing? Does that matter?
-
-
-    // 2 concurrency issues to deal with.
-    //   Requests while writes are being buffered.
-    //     Here I think a naive approach should work. Stale poll are fine.
-    //   Requests while the buffer is being written
-    //     Have the double buffer to catch incoming writes. Or rather, just duplicate the buffer clear it and release it?
-    //     What about reads though? Can you read while writing. I guess why not? Only thing I can think of would be the order of the writes fucking with the reads, but if you just write them in order it shouldn't be any different from getting a bunch of writes at once...
-
-
-    // This in effect can reorder sends and offsets within themselves. If we do all sends before offsets. Eh, just do them in the order that you go them
-    // What if we get a send or commit offset while writing? Hold the connetion open with locks? No, just put them
-    // in another buffer. Lock the first buffer and start writing to the second buffer
-
-    // Open issues:
-    //      How does aggregating the writes affect things? single write for each log and offset
-    //      Can you aggregate commitOffsets? Can you buffer it?
     writeBuffer := map[string][]interface{}{}
     writeBufferMutex := &sync.Mutex{}
     latestOffsets := [500]int{}
@@ -154,13 +126,23 @@ func main() {
     // Initialize the logs
     n.Handle("init", func(msg maelstrom.Message) error {
         if n.ID() == writerNodeID {
-            for i := 0; i <= 500; i++ {
+            for i := 0; i <= (500/groupSize); i++ {
                 writeLogCtx, writeLogCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
                 writeOffsetCtx, writeOffsetCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
                 defer writeLogCancel()
                 defer writeOffsetCancel()
-                kLogs.Write(writeLogCtx, "log-" + strconv.Itoa(i), []int{})
-                kLogs.Write(writeOffsetCtx, "offset-" + strconv.Itoa(i), 0)
+
+                defaultLogs := map[string][]int{}
+                for j := 0; j < groupSize; j++ {
+                    defaultLogs[strconv.Itoa(j+i*10)] = []int{}
+                }
+                kLogs.Write(writeLogCtx, "logGroup-" + strconv.Itoa(i*10), defaultLogs)
+
+                defaultOffsets := map[string]int{}
+                for j := 0; j < groupSize; j++ {
+                    defaultOffsets[strconv.Itoa(j+i*10)] = 0
+                }
+                kLogs.Write(writeOffsetCtx, "offsetGroup-" + strconv.Itoa(i*10), defaultOffsets)
             }
         }
 
@@ -230,7 +212,7 @@ func main() {
             msg,
             func(body map[string]interface{}) (map[string]interface{}, error) {
                 logKey := body["key"].(string)
-                logMessage := int(body["msg"].(float64))
+                logMessage := body["msg"]
 
                 writeBufferMutex.Lock()
                 writeBuffer[logKey] = append(writeBuffer[logKey], logMessage)
@@ -269,22 +251,42 @@ func main() {
             func(body map[string]interface{}) (map[string]interface{}, error) {
                 committedOffsets := body["offsets"].(map[string]interface{})
 
-                for logKey, proposedOffset := range committedOffsets {
-                    offset := int(proposedOffset.(float64))
+                // Identify the relevant groups
+                groupKeys := map[int]interface{}{}
+                for logKey, _ := range committedOffsets {
+                    logKeyInt, _ := strconv.Atoi(logKey)
+                    groupKeys[logKeyInt / 10 * 10] = nil
+                }
+
+                for groupKey, _ := range groupKeys {
                     kLogCommittedOffsetsMutex.Lock()
+
+                    // Read the group
                     readCtx, readCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
                     defer readCancel()
-                    kLogCommittedOffsetTemp, readErr := kLogs.Read(readCtx, "offset-" + logKey)
+                    groupKeyString := strconv.Itoa(groupKey)
+                    kLogCommittedOffsetGroupTemp, readErr := kLogs.Read(readCtx, "offsetGroup-" + groupKeyString)
                     if readErr != nil {
                         return nil, readErr
                     }
-                    kLogCommittedOffset := kLogCommittedOffsetTemp.(int)
+                    kLogCommittedOffsetGroup := kLogCommittedOffsetGroupTemp.(map[string]interface{})
 
-                    if offset >= kLogCommittedOffset {
-                        writeCtx, writeCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
-                        defer writeCancel()
-                        kLogs.Write(writeCtx, "offset-"+logKey, offset)
+                    // Update the relevant offsets
+                    for logKey, proposedOffset := range committedOffsets {
+                        logKeyInt, _ := strconv.Atoi(logKey)
+                        if logKeyInt / 10 * 10 == groupKey {
+                            offset := int(proposedOffset.(float64))
+                            if offset >= int(kLogCommittedOffsetGroup[logKey].(float64)) {
+                                kLogCommittedOffsetGroup[logKey] = offset
+                            }
+                        }
                     }
+
+                    // Write the group
+                    writeCtx, writeCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
+                    defer writeCancel()
+                    kLogs.Write(writeCtx, "offsetGroup-" + groupKeyString, kLogCommittedOffsetGroup)
+
                     kLogCommittedOffsetsMutex.Unlock()
                 }
 
@@ -318,29 +320,47 @@ func main() {
         }
         requestedOffsets := body["offsets"].(map[string]interface{})
 
+        // Identify the relevant groups
+        groupKeys := map[int]interface{}{}
+        for logKey, _ := range requestedOffsets {
+            logKeyInt, _ := strconv.Atoi(logKey)
+            groupKeys[logKeyInt / 10 * 10] = nil
+        }
+
         offsetResponses := map[string][][]int{}
-        // Can this be done in parallel?
-        for logKey, requestedOffset := range requestedOffsets {
-            offset := int(requestedOffset.(float64))
-            offsetMessages := [][]int{}
-            readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+        for groupKey, _ := range groupKeys {
+            // Read the group
+            readCtx, readCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
             defer readCancel()
-            kLogTemp, readErr := kLogs.Read(readCtx, "log-" + logKey)
+            groupKeyString := strconv.Itoa(groupKey)
+            kLogGroupTemp, readErr := kLogs.Read(readCtx, "logGroup-" + groupKeyString)
             if readErr != nil {
                 return readErr
             }
-            kLog := kLogTemp.([]interface{})
+            kLogGroup := kLogGroupTemp.(map[string]interface{})
 
-            var kLogOffsetSlice []interface{}
-            if len(kLog) >= offset + 100 {
-                kLogOffsetSlice = kLog[offset:offset+100]
-            } else {
-                kLogOffsetSlice = kLog[offset:]
+            // Extract the relevant offsets
+            for logKey, requestedOffset := range requestedOffsets {
+                logKeyInt, _ := strconv.Atoi(logKey)
+                if logKeyInt / 10 * 10 == groupKey {
+                    offset := int(requestedOffset.(float64))
+                    offsetMessages := [][]int{}
+                    kLog, ok := kLogGroup[logKey].([]interface{})
+                    if !ok {
+                        kLog = []interface{}{}
+                    }
+                    var kLogOffsetSlice []interface{}
+                    if len(kLog) >= offset + 100 {
+                        kLogOffsetSlice = kLog[offset:offset+100]
+                    } else {
+                        kLogOffsetSlice = kLog[offset:]
+                    }
+                    for i, logMessage := range kLogOffsetSlice {
+                        offsetMessages = append(offsetMessages, []int{offset + i, int(logMessage.(float64))})
+                    }
+                    offsetResponses[logKey] = offsetMessages
+                }
             }
-            for i, logMessage := range kLogOffsetSlice {
-                offsetMessages = append(offsetMessages, []int{offset + i, int(logMessage.(float64))})
-            }
-            offsetResponses[logKey] = offsetMessages
         }
 
         response := map[string]interface{}{
@@ -370,23 +390,33 @@ func main() {
         }
         requestedOffsetKeys := body["keys"].([]interface{})
 
-        // Does this need to be refactored to latestOffsets? Basically caching reads? sort of
-        // If so, then do we need to store the committed offsets in the klog at all?
-        // But then, do we need to store anything there? Well the offsets are *way* less memory
-        // No, these are different sets of offsets. In memory is the offset of the last messsage
-        // committed offsets it eh offset they've processed up to. That said, we could probably cache this in memory
-        // How do you deal with server crashes though
-        responseOffsets := map[string]int{}
-        for _, requestedOffsetKey := range requestedOffsetKeys {
-            offsetKey := requestedOffsetKey.(string)
+        // Identify the relevant groups
+        groupKeys := map[int]interface{}{}
+        for _, logKey := range requestedOffsetKeys {
+            logKeyInt, _ := strconv.Atoi(logKey.(string))
+            groupKeys[logKeyInt / 10 * 10] = nil
+        }
 
+        responseOffsets := map[string]int{}
+        for groupKey, _ := range groupKeys {
+            // Read the group
             readCtx, readCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
             defer readCancel()
-            offset, readErr := kLogs.Read(readCtx, "offset-" + offsetKey)
+            groupKeyString := strconv.Itoa(groupKey)
+            kLogCommittedOffsetGroupTemp, readErr := kLogs.Read(readCtx, "offsetGroup-" + groupKeyString)
             if readErr != nil {
                 return readErr
             }
-            responseOffsets[offsetKey] = offset.(int)
+            kLogCommittedOffsetGroup := kLogCommittedOffsetGroupTemp.(map[string]interface{})
+
+            // Extract the relevant offsets
+            for _, requestedOffsetKey := range requestedOffsetKeys {
+                requestedOffsetKeyInt, _ := strconv.Atoi(requestedOffsetKey.(string))
+                if requestedOffsetKeyInt / 10 * 10 == groupKey {
+                    offset := kLogCommittedOffsetGroup[requestedOffsetKey.(string)]
+                    responseOffsets[requestedOffsetKey.(string)] = int(offset.(float64))
+                }
+            }
         }
 
         response := map[string]interface{}{
@@ -405,25 +435,46 @@ func main() {
                 tempWriteBuffer := writeBuffer
                 writeBuffer = map[string][]interface{}{}
                 writeBufferMutex.Unlock()
-                for logKey, bufferedMessages := range tempWriteBuffer {
-                    kLogsMutex.Lock() // Don't actually thing this is necessary anymore. Only needed if previous tick is still running. We'll keep it.
 
-                    // Read the previous value of the log
-                    readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+                // Identify the relevant groups
+                groupKeys := map[int]interface{}{}
+                for logKey, _ := range tempWriteBuffer {
+                    logKeyInt, _ := strconv.Atoi(logKey)
+                    groupKeys[logKeyInt / 10 * 10] = nil
+                }
+
+                for groupKey, _ := range groupKeys {
+                    kLogsMutex.Lock() // Don't think this is necessary anymore since this has been moved to the ticker
+
+                    // Read the group
+                    readCtx, readCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
                     defer readCancel()
-                    kLog, _ := kLogs.Read(readCtx, "log-"+logKey)
+                    groupKeyString := strconv.Itoa(groupKey)
+                    kLogGroupTemp, _ := kLogs.Read(readCtx, "logGroup-" + groupKeyString)
+                    kLogGroup, ok := kLogGroupTemp.(map[string]interface{})
+                    if !ok {
+                        kLogGroup = map[string]interface{}{}
+                    }
 
-                    // Append the new value
-                    newKLog := append(kLog.([]interface{}), bufferedMessages...)
+                    // Append the messages to each log
+                    for logKey, bufferedMessages := range tempWriteBuffer {
+                        logKeyInt, _ := strconv.Atoi(logKey)
+                        if logKeyInt / 10 * 10 == groupKey {
+                            currentLog, ok := kLogGroup[logKey].([]interface{})
+                            if !ok {
+                                currentLog = []interface{}{}
+                            }
+                            kLogGroup[logKey] = append(currentLog, bufferedMessages...)
+                        }
+                    }
 
-                    // Write the new log back to the kv
-                    writeCtx, writeCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+                    // Write the group
+                    writeCtx, writeCancel := context.WithTimeout(context.Background(), 100 * time.Millisecond)
                     defer writeCancel()
-                    kLogs.Write(writeCtx, "log-"+logKey, newKLog)
+                    kLogs.Write(writeCtx, "logGroup-" + groupKeyString, kLogGroup)
 
                     kLogsMutex.Unlock()
                 }
-
             }
         }
     }()
