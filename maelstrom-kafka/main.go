@@ -1,74 +1,72 @@
 package main
 
-// Challenge in this problem: Write contention. Multiple nodes trying to write to the same log
+/*
+Challenge in this problem: Write contention. Multiple nodes trying to write to the same log
 
-// Main thing I learned: How you structure data in your shared resource defines everything about how your system works
+Main thing I learned: How you structure data in your shared resource defines everything about how your system works
 
-// Implemented Approach: Single write leader with message forwarding
-// Tradeoffs:
-// * Solves write contention with a simple solution
-// * Doesn't increase messages-per-op too much
-// * Requires a single writer node. Strict bottleneck to scaling the system
+Implemented Approach: Single write leader with message forwarding
+Tradeoffs:
+    * Solves write contention with a simple solution
+    * Doesn't increase messages-per-op too much
+    * Requires a single writer node. Strict bottleneck to scaling the system
 
-// Implemented Optimizations:
-// * Have a single writer with message forwarding so you don't need to do CAS with retries
-//   (messages per op, between 6.1)
-// * Buffer writes (messages per op, 5.5) Down a bit, but not too much.
-//      Can do this because reads don't have ot be up to date, so we can tolerate some delay on writes
-//      Why am I optimizing writes when it's poll reads that are killing performance?
-//      Drawbacks: latency, data loss on node crash, debugging/system anaylsis
-//      Now that I implemented it, write buffers seem like a generally bad idea
-// * Instant replies on buffered writes.
-//      Rather than waiting for the write to be committed, just reply immediately
-//      Do this by storing an in-memory hash of max offsets
-//      Tradeoff, what happens when your machine crashes and you lose the in memory hash? Would need to rebuild it from the kv
-// * Group logs into sets of 10 (messages per op, 3.3)
-//      Significantly reduces requests to the kv
-//      Tradeoff, larger messages and can cause more write contention depending on how you do everything else
-//      Only works well here because we have 1 writer so there's no contention. Otherwise, it would massively increase the amount of data being access simultaneously
-// * Parallelize requests to the KV with goroutines. Messages per opp stay the same but latency and lag go down.
+Implemented Optimizations:
+    * Have a single writer with message forwarding so you don't need to do CAS with retries
+      (messages per op, between 6.1)
+    * Buffer writes (messages per op, 5.5) Down a bit, but not too much.
+         Can do this because reads don't have to be up to date, so we can tolerate some delay on writes
+         Drawbacks: latency, data loss on node crash, debugging/system anaylsis
+         Now that I implemented it, write buffers seem like a generally bad idea
+    * Instant replies on buffered writes.
+         Rather than waiting for the write to be committed, just reply immediately
+         Do this by storing an in-memory hash of max offsets
+         Tradeoff, machine crashes will cause data loss
+    * Group logs into sets of 10 (messages per op, 3.3)
+         Significantly reduces requests to the kv
+         Tradeoff, larger messages and can cause more write contention depending on how you do everything else
+         Only works well here because we have 1 writer so there's no contention. Otherwise, it would massively increase the amount of data being accessed simultaneously
+    * Parallelize requests to the KV with goroutines. Messages per opp stay the same but latency and lag go down.
 
 
-// Notes:
+Possible Approaches:
+    CAS with retries
+        will degrade as node count goes up?
+        expensive in terms of messages per op
+    Single write leader with message forwarding
+    Log specific writer nodes with message forwarding
+        Each log has a single node that does all the writing to that log.
+        You can then solve concurrent requests with just mutexes
+        Would need to forward messages to the writer node. These would need to be idempotent
+            This would be the complex step
+        Supports buffering writes
+    Node-specific log subsets (probably the best solution)
+        All nodes write to all logs without contention (no message forwarding)
+        Can scale arbitrarily
+        Key insight: separate read and write spaces in the KV
+        Each node writes to it's own subset of each log. These are then periodically stitched together into a separate, single log for reading
+        KV structure: where n is the log id, m is the node id
+          readLog-1
+          readLog-2
+          ...
+          readLog-n
 
-// Shape of the problem
-//    There can be gaps in offsets
-//    No recency requirement. Poll does not have to return the most up to date messages coming in through send
-//    Poll does have to return messages without skipping any though
-//    Offset log should always increase. No inserting message before previous messages. Append only
-//
-// Possible Approaches:
-//      CAS with retries
-//          will degrade as node count goes up?
-//          expensive in terms of messages per op
-//      Single write leader with message forwarding
-//      Log specific writer nodes with message forwarding
-//          each log has a single node that does all the writing to that log.
-//          You can then solve concurrent requests with just mutexes
-//          Would need to forward messages to the writer node. These would need to be idempotent
-//              This would be the complex step
-//          Supports buffering writes
-//      Node-specific log subsets (probably the best solution)
-//          all nodes write to all logs without contention (no message forwarding)
-//          can scale arbitrarily
-//          Key insight: separate read and write spaces in the KV
-//          Each node writes to it's own subset of each log. These are then periodically stitched together into a separate, single log for reading
+          writeLog-1-1
+          writeLog-1-2
+          ...
+          writeLog-n-m
+        Drawbacks: more complex, more latency?
 
-// Potential optimizations
-// * Cache ths logs. Read from cached logs rather than the kv
-// * Replace read-write locks with CAS with retries
-//      Would work very well with a single writer node.
-//      Only contention would be within writer goroutines, not between nodes
-//      Should improve latency and lag
-// * Minimize read message size? Don't return whole log for every read?
-// * Implement zipper idea. 2 datasets in the kv. Published logs for reading. Smaller write space for segmented writes paired with a periodic processing of the write space into the published logs. Works because reads don't have to be up to date. Allows all nodes to write without contention and can scale up additional nodes. No single node bottleneck. Probably best solution.
-// * Keep some info locally in the node? What would I keep? Most recent logs?
-//   * How does this handle if a node goes down? Get's into the idea of "promotion". Possibly out of the scope of the challenge? I think all it does is partition the nodes. But that's enough to break the segmentation idea. If you're partitioned, how do you handle that. I guess you could buffer those as well... Then your writes get *really* out of order. Again, maybe that doesn't matter. Problem only talked aout read/write consistency
-// * Some kind of data retructuring
-// * Making some use of multiple data structures (one for reads, one for writes?)
-// * don't read before you write. Keep a local version of each log and just write what should be in the db.
-//   * I mean, if we're doing that, we don't need to write either, just keep an in memory log and never use the kv. If we only have one writer..., but then who can read? forward those as well :), just use the node as the kv
-//   * feels like it's going against the spirit of the problem
+Potential optimizations:
+    * Cache ths logs. Read from cached logs rather than the kv
+    * Replace read-write locks with CAS with retries
+         Would work very well with a single writer node.
+         Only contention would be within writer goroutines, not between nodes
+         Should improve latency and lag
+    * Minimize read message size? Don't return whole log for every read?
+    * Keep some info locally in the node? What would I keep? Most recent logs?
+      * How does this handle if a node goes down? Get's into the idea of "promotion". Possibly out of the scope of the challenge? I think all it does is partition the nodes. But that's enough to break the segmentation idea. If you're partitioned, how do you handle that. I guess you could buffer those as well... Then your writes get *really* out of order. Again, maybe that doesn't matter. Problem only talked aout read/write consistency
+*/
 
 
 
@@ -301,6 +299,7 @@ func main() {
         }
 
         offsetResponses := map[string][][]int{}
+        // Parallelizing via goroutines here is causing crashes. Couldn't figure out why.
         // offsetResponsesMutex := sync.Mutex{}
         // wg := sync.WaitGroup{}
         for groupKey, _ := range groupKeys {
@@ -411,6 +410,7 @@ func main() {
         return n.Reply(msg, response)
     })
 
+    // Periodically flush the write buffer
     go func() {
         writeBufferFlushTicker := time.NewTicker(time.Second / 50)
         defer writeBufferFlushTicker.Stop()

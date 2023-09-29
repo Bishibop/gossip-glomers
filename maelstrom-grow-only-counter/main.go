@@ -1,29 +1,8 @@
 package main
 
-
-// So if there is no state, what are our thoughts:
-//
-// Problem:
-//  How do you handle concurrent writes?
-//   2 requests writing over each other
-//   Read the current value, then Compare and Swap the new swap? Retry if the compare failes
-//   You could simply avoid the problem entirely, instead of tracking a sum, track individual requests with UUIDs
-//   Sum all the requests on reads. This makes reads super inefficient?
-//   Somehow combine these ideas?, but then you run into concurrent writes again...
-//   Are concurrent writes even a thing? What does sequentially consistent even mean?
-
-
-// Possilbe solution:
-//  in the key value, each node tracks it's own sum separately and the sums the three values on read.
-//  This seems like a good idea regardless.
-//  Would it need to map to the nodes themselves? if you do compare and swap, could you just n buckets, say 20, and just pick a random one? This would mean different nodes are accessing the same buckets, which removes the benefits of sequential consistency, but if you're doing compare and swap, maybe that doesn't matter...
-//  Well, each node could have it's own n buckets. Then you get both benefits
-//
-// So the problem with the cas approach is that the last cas is not reflected in the first two (final) reads that come after that. So it's not an over written write, it's just the last one that needs a sec. Same in the mutex solution? Would explain only having a single mistake rather than dozens...
-
-// So it's just the final reads outrunning the final write? That's lame
-// Yeah, same for the mutex solution. Does nothing but wait on the last write.
-// Bizzarre, is the whole point of this problem just to bucket the sums?
+// Bucket the sums in the KV and sum those buckets on read.
+// This removes internode write contention.
+// Contention can only come from within a single node across multiple requests. Solved with mutexs or CAS.
 
 import (
     "log"
@@ -57,7 +36,7 @@ func main() {
         readCtx, readCancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
         defer readCancel()
 
-        // Commenting out this lock always results in a single failed add. Very bizzare.
+        // Commenting out this lock always results in a single failed add at the very end. Bizarre.
         // Feels like it should be a lot more? Maybe a simultaneous write is hardcoded in the workload.
         kvMutex.Lock()
 

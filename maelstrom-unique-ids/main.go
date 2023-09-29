@@ -10,6 +10,9 @@ import (
     maelstrom "github.com/jepsen-io/maelstrom/demo/go"
 )
 
+// Interleaved Partitions
+// Each node uses its id to generate incrementing ids that never intersect with other nodes.
+// This property only holds if the number of nodes is fixed.
 func main() {
     n := maelstrom.NewNode()
     counter := 0
@@ -36,28 +39,6 @@ func main() {
         os.Exit(1)
     }
 }
-
-
-// Interleaved Partitions
-
-// counter := 0
-//
-// n.Handle("generate", func(msg maelstrom.Message) error {
-//     numberOfNodes := len(n.NodeIDs())
-//     partitionSeed, err := strconv.Atoi(n.ID()[1:])
-//     if err != nil {
-//         fmt.Println("Error converting string to integer:", err)
-//         return err
-//     }
-//
-//     body := map[string]interface{}{}
-//     body["type"] = "generate_ok"
-//     body["id"] = partitionSeed + (counter * numberOfNodes)
-//
-//     counter = counter + 1
-//
-//     return n.Reply(msg, body)
-// })
 
 
 // Timestamps

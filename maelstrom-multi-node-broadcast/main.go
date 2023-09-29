@@ -1,6 +1,10 @@
-// TODO:
-// * Refactor shared state with mutexes to use manager goroutines and channels
-// * Refactor to use RPC rather than Send
+/*
+Broadcast via set of leaders. Leaders broadcast to leaders and to followers. Followers broadcast to all leaders.
+If a node receives no response, mark the destination node as unresponsive, ping until it responds, and then send the message again.
+
+Your topology is key to performance. Grid is the worst possible topology :)
+*/
+
 package main
 
 import (
@@ -178,7 +182,6 @@ func main() {
         }
     })
 
-
     n.Handle("read", func(msg maelstrom.Message) error {
         messagesMutex.Lock()
         messages := make([]float64, 0, len(receivedMessages))
@@ -205,6 +208,7 @@ func main() {
         return n.Reply(msg, response)
     })
 
+    // Ping unreponsive nodes
     go func() {
         pingTicker := time.NewTicker(time.Second / 4)
         defer pingTicker.Stop()
@@ -221,6 +225,7 @@ func main() {
         }
     }()
 
+    // Broadcast messages to followers
     go func() {
         broadcastSetTicker := time.NewTicker(time.Second / 10)
         defer broadcastSetTicker.Stop()

@@ -1,4 +1,4 @@
-module maelstrom-totally-available
+module maelstrom-txn
 
 go 1.20
 
